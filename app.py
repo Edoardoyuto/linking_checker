@@ -294,6 +294,10 @@ def find_chrome_path() -> str | None:
     return next((path for path in chrome_candidates if path and os.path.exists(path)), None)
 
 
+def can_launch_local_browser_window() -> bool:
+    return sys.platform == "win32"
+
+
 def open_pdf_in_chrome_once(pdf_url: str) -> None:
     request_id = st.session_state.get("pdf_open_request_id", 0)
     if not pdf_url or request_id == st.session_state.get("pdf_opened_request_id"):
@@ -778,8 +782,12 @@ pdf_url = st.sidebar.text_input(
     value=get_arxiv_pdf_url(record),
     key=f"pdf_url_{selected}",
 )
-open_pdf_in_chrome_once(pdf_url)
-st.sidebar.caption("PDFはChromeの別ウィンドウで開きます。")
+if can_launch_local_browser_window():
+    open_pdf_in_chrome_once(pdf_url)
+    st.sidebar.caption("PDFはChromeの別ウィンドウで開きます。")
+elif pdf_url:
+    st.sidebar.link_button("PDFを新しいタブで開く", pdf_url, use_container_width=True)
+    st.sidebar.caption("デプロイ環境では、ボタンからPC側のブラウザで開きます。")
 
 st.markdown('<div class="json-pane-marker"></div>', unsafe_allow_html=True)
 st.subheader("JSON")
