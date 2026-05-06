@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import tempfile
 import webbrowser
+import winreg
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 from typing import Any
@@ -245,9 +246,25 @@ def close_current_pdf_window() -> None:
 
 
 def find_chrome_path() -> str | None:
+    registry_paths = [
+        (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe"),
+        (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe"),
+        (winreg.HKEY_CURRENT_USER, r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe"),
+    ]
+    for root_key, sub_key in registry_paths:
+        try:
+            with winreg.OpenKey(root_key, sub_key) as key:
+                chrome_path = winreg.QueryValue(key, None)
+                if chrome_path and os.path.exists(chrome_path):
+                    return chrome_path
+        except OSError:
+            pass
+
     chrome_candidates = [
         shutil.which("chrome"),
         shutil.which("chrome.exe"),
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
         os.path.join(os.environ.get("PROGRAMFILES", ""), "Google", "Chrome", "Application", "chrome.exe"),
         os.path.join(
             os.environ.get("PROGRAMFILES(X86)", ""),
@@ -278,20 +295,24 @@ def open_pdf_in_chrome_once(pdf_url: str) -> None:
     if chrome_path:
         profile_dir = os.path.join(tempfile.gettempdir(), "linking-checker-pdf-chrome-profile")
         os.makedirs(profile_dir, exist_ok=True)
-        process = subprocess.Popen(
-            [
-                chrome_path,
-                "--new-window",
-                f"--user-data-dir={profile_dir}",
-                "--no-first-run",
-                "--disable-extensions",
-                pdf_url,
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        st.session_state.pdf_window_process = process
-        st.session_state.pdf_window_pid = process.pid
+        try:
+            process = subprocess.Popen(
+                [
+                    chrome_path,
+                    "--new-window",
+                    f"--user-data-dir={profile_dir}",
+                    "--no-first-run",
+                    "--disable-extensions",
+                    pdf_url,
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            st.session_state.pdf_window_process = process
+            st.session_state.pdf_window_pid = process.pid
+        except OSError as exc:
+            st.sidebar.warning(f"Chromeの起動に失敗しました: {exc}")
+            webbrowser.open_new_tab(pdf_url)
     else:
         st.sidebar.warning("Chromeが見つからないため、既定ブラウザで開きます。前のPDFは自動で閉じられません。")
         webbrowser.open_new_tab(pdf_url)
