@@ -1,0 +1,742 @@
+import base64
+import copy
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import tempfile
+import webbrowser
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
+from typing import Any
+
+import streamlit as st
+
+
+st.set_page_config(
+    page_title="JSON/PDF Checker",
+    page_icon="LC",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+
+st.markdown(
+    """
+    <style>
+    div.stButton > button {
+        min-height: 2.25rem;
+        white-space: nowrap;
+    }
+    div.stButton > button[kind="primary"] {
+        background: #dc2626;
+        border-color: #dc2626;
+        color: #ffffff;
+    }
+    div.stButton > button[kind="primary"]:hover {
+        background: #b91c1c;
+        border-color: #b91c1c;
+        color: #ffffff;
+    }
+    div[data-testid="stVerticalBlock"] {
+        gap: 0.45rem;
+    }
+    div[data-testid="stExpander"] details {
+        padding-bottom: 0.35rem;
+    }
+    div[data-testid="stExpander"] div[data-testid="stVerticalBlock"] {
+        gap: 0.35rem;
+    }
+    div[data-testid="stMetric"] {
+        padding: 0;
+    }
+    hr {
+        margin: 0.45rem 0;
+    }
+    .block-container {
+        padding-top: 1.5rem;
+    }
+    section[data-testid="stSidebar"] {
+        max-height: 100vh;
+        overflow-y: auto;
+    }
+    div[data-testid="column"]:has(.json-pane-marker) {
+        height: calc(100vh - 7.5rem);
+        min-height: 0;
+    }
+    div[data-testid="column"]:has(.json-pane-marker) > div[data-testid="stVerticalBlock"] {
+        max-height: calc(100vh - 7.5rem);
+        overflow-y: auto;
+        padding-right: 0.5rem;
+    }
+    div[data-testid="column"]:has(.json-pane-marker) > div[data-testid="stVerticalBlock"]::-webkit-scrollbar {
+        width: 10px;
+    }
+    div[data-testid="column"]:has(.json-pane-marker) > div[data-testid="stVerticalBlock"]::-webkit-scrollbar-thumb {
+        background: #cbd5e1;
+        border-radius: 999px;
+        border: 2px solid #ffffff;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+
+@st.cache_data(show_spinner=False)
+def fetch_pdf_bytes(pdf_url: str) -> bytes:
+    request = Request(
+        pdf_url,
+        headers={
+            "User-Agent": "Mozilla/5.0 JSON-PDF-Checker/1.0",
+            "Accept": "application/pdf,*/*",
+        },
+    )
+    with urlopen(request, timeout=20) as response:
+        content_type = response.headers.get("Content-Type", "")
+        data = response.read()
+
+    if not data:
+        raise ValueError("PDF response is empty.")
+    if "pdf" not in content_type.lower() and not data.startswith(b"%PDF"):
+        raise ValueError(f"PDFではない応答を受け取りました: {content_type or 'unknown'}")
+    return data
+
+
+def load_json_records(text: str) -> list[dict[str, Any]]:
+    text = text.strip()
+    if not text:
+        return []
+
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        records: list[dict[str, Any]] = []
+        for line_no, line in enumerate(text.splitlines(), start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"JSONL line {line_no}: {exc.msg}") from exc
+            if not isinstance(item, dict):
+                raise ValueError(f"JSONL line {line_no}: object expected")
+            records.append(item)
+        return records
+
+    if isinstance(parsed, dict):
+        return [parsed]
+    if isinstance(parsed, list) and all(isinstance(item, dict) for item in parsed):
+        return parsed
+    raise ValueError("JSON must be an object, an array of objects, or JSONL objects.")
+
+
+def dump_jsonl(records: list[dict[str, Any]]) -> str:
+    return "\n".join(
+        json.dumps(strip_position_fields(record), ensure_ascii=False, separators=(",", ":"))
+        for record in records
+    )
+
+
+def strip_position_fields(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: strip_position_fields(item)
+            for key, item in value.items()
+            if key not in {"line_no", "column_no"}
+        }
+    if isinstance(value, list):
+        return [strip_position_fields(item) for item in value]
+    return value
+
+
+def get_arxiv_pdf_url(record: dict[str, Any]) -> str:
+    arxiv_id = str(record.get("arxiv_id", "")).strip()
+    return f"https://arxiv.org/pdf/{arxiv_id}" if arxiv_id else ""
+
+
+def request_pdf_open() -> None:
+    st.session_state.pdf_open_request_id = st.session_state.get("pdf_open_request_id", 0) + 1
+
+
+def set_selected_record(index: int, record_count: int) -> None:
+    if record_count <= 0:
+        return
+    if index is None:
+        return
+    selected_index = min(max(int(index), 0), record_count - 1)
+    st.session_state.selected_record_index = selected_index
+    request_pdf_open()
+
+
+def close_current_pdf_window() -> None:
+    process = st.session_state.get("pdf_window_process")
+    pid = st.session_state.get("pdf_window_pid")
+    if not process and not pid:
+        return
+
+    try:
+        if pid:
+            subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        elif process.poll() is None:
+            process.terminate()
+    except Exception:
+        pass
+    finally:
+        st.session_state.pdf_window_process = None
+        st.session_state.pdf_window_pid = None
+
+
+def find_chrome_path() -> str | None:
+    chrome_candidates = [
+        shutil.which("chrome"),
+        shutil.which("chrome.exe"),
+        os.path.join(os.environ.get("PROGRAMFILES", ""), "Google", "Chrome", "Application", "chrome.exe"),
+        os.path.join(
+            os.environ.get("PROGRAMFILES(X86)", ""),
+            "Google",
+            "Chrome",
+            "Application",
+            "chrome.exe",
+        ),
+        os.path.join(
+            os.environ.get("LOCALAPPDATA", ""),
+            "Google",
+            "Chrome",
+            "Application",
+            "chrome.exe",
+        ),
+    ]
+    return next((path for path in chrome_candidates if path and os.path.exists(path)), None)
+
+
+def open_pdf_in_chrome_once(pdf_url: str) -> None:
+    request_id = st.session_state.get("pdf_open_request_id", 0)
+    if not pdf_url or request_id == st.session_state.get("pdf_opened_request_id"):
+        return
+
+    close_current_pdf_window()
+
+    chrome_path = find_chrome_path()
+    if chrome_path:
+        profile_dir = os.path.join(tempfile.gettempdir(), "linking-checker-pdf-chrome-profile")
+        os.makedirs(profile_dir, exist_ok=True)
+        process = subprocess.Popen(
+            [
+                chrome_path,
+                "--new-window",
+                f"--user-data-dir={profile_dir}",
+                "--no-first-run",
+                "--disable-extensions",
+                pdf_url,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        st.session_state.pdf_window_process = process
+        st.session_state.pdf_window_pid = process.pid
+    else:
+        st.sidebar.warning("Chromeが見つからないため、既定ブラウザで開きます。前のPDFは自動で閉じられません。")
+        webbrowser.open_new_tab(pdf_url)
+
+    st.session_state.pdf_opened_request_id = request_id
+
+
+def render_pdf_bytes(pdf_bytes: bytes, height: int) -> None:
+    encoded = base64.b64encode(pdf_bytes).decode("ascii")
+    component_height = max(height, 520)
+    pdf_data = json.dumps(encoded)
+    st.components.v1.html(
+        f"""
+        <!doctype html>
+        <html>
+        <head>
+          <meta charset="utf-8" />
+          <style>
+            html, body {{
+              margin: 0;
+              padding: 0;
+              height: 100%;
+              background: #f3f4f6;
+              color: #111827;
+              font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            }}
+            .toolbar {{
+              position: sticky;
+              top: 0;
+              z-index: 2;
+              display: flex;
+              gap: 8px;
+              align-items: center;
+              padding: 8px;
+              background: #ffffff;
+              border-bottom: 1px solid #d1d5db;
+            }}
+            button {{
+              min-width: 40px;
+              min-height: 34px;
+              border: 1px solid #d1d5db;
+              border-radius: 6px;
+              background: #ffffff;
+              color: #111827;
+              cursor: pointer;
+            }}
+            button:disabled {{
+              color: #9ca3af;
+              cursor: default;
+            }}
+            #status {{
+              flex: 1;
+              min-width: 120px;
+              font-size: 14px;
+              text-align: center;
+            }}
+            #viewer {{
+              height: {component_height - 52}px;
+              overflow: auto;
+              padding: 14px;
+              box-sizing: border-box;
+            }}
+            canvas {{
+              display: block;
+              max-width: 100%;
+              margin: 0 auto;
+              background: #ffffff;
+              box-shadow: 0 1px 4px rgba(17, 24, 39, 0.18);
+            }}
+            #message {{
+              padding: 24px;
+              text-align: center;
+              color: #4b5563;
+            }}
+          </style>
+        </head>
+        <body>
+          <div class="toolbar">
+            <button id="prev" title="前のページ">‹</button>
+            <button id="next" title="次のページ">›</button>
+            <span id="status">Loading PDF...</span>
+            <button id="zoomOut" title="縮小">−</button>
+            <button id="zoomIn" title="拡大">＋</button>
+          </div>
+          <div id="viewer">
+            <canvas id="canvas"></canvas>
+            <div id="message"></div>
+          </div>
+          <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38/pdf.min.mjs" type="module"></script>
+          <script type="module">
+            import * as pdfjsLib from "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38/pdf.min.mjs";
+            pdfjsLib.GlobalWorkerOptions.workerSrc =
+              "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38/pdf.worker.min.mjs";
+
+            const base64 = {pdf_data};
+            const bytes = Uint8Array.from(atob(base64), c => c.charCodeAt(0));
+            const canvas = document.getElementById("canvas");
+            const context = canvas.getContext("2d");
+            const status = document.getElementById("status");
+            const message = document.getElementById("message");
+            const prev = document.getElementById("prev");
+            const next = document.getElementById("next");
+            const zoomIn = document.getElementById("zoomIn");
+            const zoomOut = document.getElementById("zoomOut");
+
+            let pdf = null;
+            let pageNumber = 1;
+            let scale = 1.25;
+            let rendering = false;
+            let pendingPage = null;
+
+            function updateControls() {{
+              prev.disabled = !pdf || pageNumber <= 1;
+              next.disabled = !pdf || pageNumber >= pdf.numPages;
+              status.textContent = pdf
+                ? `Page ${{pageNumber}} / ${{pdf.numPages}}  ${{Math.round(scale * 100)}}%`
+                : "Loading PDF...";
+            }}
+
+            async function renderPage(number) {{
+              rendering = true;
+              updateControls();
+              const page = await pdf.getPage(number);
+              const viewport = page.getViewport({{ scale }});
+              canvas.width = viewport.width;
+              canvas.height = viewport.height;
+              await page.render({{ canvasContext: context, viewport }}).promise;
+              rendering = false;
+              updateControls();
+              if (pendingPage !== null) {{
+                const nextPage = pendingPage;
+                pendingPage = null;
+                await renderPage(nextPage);
+              }}
+            }}
+
+            function queueRender(number) {{
+              if (rendering) {{
+                pendingPage = number;
+              }} else {{
+                renderPage(number);
+              }}
+            }}
+
+            prev.addEventListener("click", () => {{
+              if (pageNumber <= 1) return;
+              pageNumber -= 1;
+              queueRender(pageNumber);
+            }});
+
+            next.addEventListener("click", () => {{
+              if (!pdf || pageNumber >= pdf.numPages) return;
+              pageNumber += 1;
+              queueRender(pageNumber);
+            }});
+
+            zoomOut.addEventListener("click", () => {{
+              scale = Math.max(0.5, scale - 0.15);
+              queueRender(pageNumber);
+            }});
+
+            zoomIn.addEventListener("click", () => {{
+              scale = Math.min(2.8, scale + 0.15);
+              queueRender(pageNumber);
+            }});
+
+            try {{
+              pdf = await pdfjsLib.getDocument({{ data: bytes }}).promise;
+              message.textContent = "";
+              await renderPage(pageNumber);
+            }} catch (error) {{
+              canvas.style.display = "none";
+              status.textContent = "PDF表示エラー";
+              message.textContent = error?.message || String(error);
+            }}
+          </script>
+        </body>
+        </html>
+        """,
+        height=component_height,
+        scrolling=False,
+    )
+
+
+def render_pdf_viewer(pdf_bytes: bytes | None, pdf_url: str, height: int) -> None:
+    if pdf_bytes:
+        render_pdf_bytes(pdf_bytes, height)
+        return
+
+    if pdf_url:
+        st.link_button("PDFを新しいタブで開く", pdf_url, use_container_width=True)
+        try:
+            with st.spinner("PDFを取得しています..."):
+                render_pdf_bytes(fetch_pdf_bytes(pdf_url), height)
+        except (HTTPError, URLError, TimeoutError, ValueError) as exc:
+            st.error(f"PDFを埋め込み表示できませんでした: {exc}")
+        return
+
+    st.info("PDFをアップロードするか、JSONに arxiv_id を入れてください。")
+
+
+def ensure_author_shape(author: dict[str, Any]) -> dict[str, Any]:
+    author.setdefault("name", "")
+    affiliations = author.get("affiliations")
+    if not isinstance(affiliations, list):
+        author["affiliations"] = []
+    return author
+
+
+def author_editor(record: dict[str, Any], record_index: int) -> None:
+    authors = record.setdefault("authors", [])
+    if not isinstance(authors, list):
+        st.warning("authors が配列ではないため、空の配列に置き換えました。")
+        record["authors"] = []
+        authors = record["authors"]
+
+    left, right = st.columns([1, 1])
+    with left:
+        if st.button("著者を追加", use_container_width=True):
+            authors.append({"name": "", "affiliations": []})
+            st.rerun()
+    with right:
+        st.metric("著者数", len(authors))
+
+    for author_index, author in enumerate(authors):
+        if not isinstance(author, dict):
+            authors[author_index] = {"name": str(author), "affiliations": []}
+            author = authors[author_index]
+
+        ensure_author_shape(author)
+        title = author.get("name") or f"Author {author_index + 1}"
+        with st.expander(title, expanded=True):
+            author["name"] = st.text_input(
+                "Name",
+                value=str(author.get("name", "")),
+                key=f"name_{record_index}_{author_index}",
+            )
+
+            button_cols = st.columns(2)
+            with button_cols[0]:
+                if st.button(
+                    "所属を追加",
+                    key=f"add_aff_{record_index}_{author_index}",
+                    use_container_width=True,
+                ):
+                    author["affiliations"].append({"institution": "", "address": ""})
+                    st.rerun()
+            with button_cols[1]:
+                if st.button(
+                    "著者を削除",
+                    key=f"del_author_{record_index}_{author_index}",
+                    use_container_width=True,
+                ):
+                    authors.pop(author_index)
+                    st.rerun()
+
+            for affiliation_index, affiliation in enumerate(author["affiliations"]):
+                if not isinstance(affiliation, dict):
+                    author["affiliations"][affiliation_index] = {
+                        "institution": str(affiliation),
+                        "address": "",
+                    }
+                    affiliation = author["affiliations"][affiliation_index]
+
+                st.divider()
+                st.caption(f"Affiliation {affiliation_index + 1}")
+                affiliation["institution"] = st.text_area(
+                    "Institution",
+                    value=str(affiliation.get("institution", "")),
+                    key=f"inst_{record_index}_{author_index}_{affiliation_index}",
+                    height=60,
+                )
+                if st.button(
+                    "所属を削除",
+                    key=f"del_aff_{record_index}_{author_index}_{affiliation_index}",
+                ):
+                    author["affiliations"].pop(affiliation_index)
+                    st.rerun()
+
+
+def record_summary(record: dict[str, Any]) -> str:
+    arxiv_id = record.get("arxiv_id", "")
+    authors = record.get("authors", [])
+    names = []
+    if isinstance(authors, list):
+        names = [
+            str(author.get("name", ""))
+            for author in authors
+            if isinstance(author, dict) and author.get("name")
+        ]
+    prefix = str(arxiv_id) if arxiv_id else "no arxiv_id"
+    return f"{prefix} | {', '.join(names[:3])}" if names else prefix
+
+
+def initialize_state() -> None:
+    if "records" not in st.session_state:
+        st.session_state.records = []
+    if "original_records" not in st.session_state:
+        st.session_state.original_records = copy.deepcopy(st.session_state.records)
+
+
+def sync_selected_record_from_selectbox() -> None:
+    index = st.session_state.get("record_selector")
+    if not isinstance(index, int):
+        return
+    set_selected_record(index, len(st.session_state.records))
+
+
+@st.dialog("編集内容を確認")
+def confirm_next_dialog(selected_index: int) -> None:
+    current_record_json = json.dumps(
+        strip_position_fields(st.session_state.records[selected_index]),
+        ensure_ascii=False,
+        indent=2,
+    )
+    st.caption("この編集内容で次の論文に進みますか？")
+    st.text_area(
+        "現在のJSON",
+        value=current_record_json,
+        height=360,
+        disabled=True,
+    )
+
+    confirm_col, cancel_col = st.columns(2)
+    with confirm_col:
+        if st.button("確認して次へ", type="primary", use_container_width=True):
+            if selected_index < len(st.session_state.records) - 1:
+                st.session_state.pending_selected_record_index = selected_index + 1
+                request_pdf_open()
+            st.rerun()
+    with cancel_col:
+        if st.button("キャンセル", use_container_width=True):
+            st.rerun()
+
+
+initialize_state()
+
+st.title("JSON/PDF Checker")
+
+with st.sidebar:
+    st.header("Files")
+    json_file = st.file_uploader("JSON / JSONL", type=["json", "jsonl"])
+    if json_file is not None:
+        file_bytes = json_file.getvalue()
+        upload_signature = (
+            json_file.name,
+            len(file_bytes),
+            hashlib.sha256(file_bytes).hexdigest(),
+        )
+        if st.session_state.get("uploaded_dataset_signature") != upload_signature:
+            try:
+                text = file_bytes.decode("utf-8-sig")
+                st.session_state.records = [
+                    strip_position_fields(record) for record in load_json_records(text)
+                ]
+                st.session_state.original_records = copy.deepcopy(st.session_state.records)
+                st.session_state.uploaded_dataset_signature = upload_signature
+                close_current_pdf_window()
+                st.session_state.pdf_opened_request_id = None
+                set_selected_record(0, len(st.session_state.records))
+                st.success(f"{len(st.session_state.records)}件を読み込みました。")
+            except (UnicodeDecodeError, ValueError) as exc:
+                st.error(f"読み込みに失敗しました: {exc}")
+
+    st.divider()
+    st.download_button(
+        "修正済みJSONLをダウンロード",
+        data=dump_jsonl(st.session_state.records),
+        file_name="review_result.jsonl",
+        mime="application/x-jsonlines",
+        use_container_width=True,
+        disabled=not st.session_state.records,
+    )
+
+records = st.session_state.records
+if not records:
+    st.info("JSON/JSONLファイルをアップロードしてください。")
+    st.stop()
+
+record_labels = [record_summary(record) for record in records]
+if "selected_record_index" not in st.session_state:
+    st.session_state.selected_record_index = 0
+st.session_state.selected_record_index = min(
+    max(int(st.session_state.selected_record_index), 0),
+    len(records) - 1,
+)
+if "pending_selected_record_index" in st.session_state:
+    set_selected_record(st.session_state.pending_selected_record_index, len(records))
+    del st.session_state.pending_selected_record_index
+if "record_selector" not in st.session_state:
+    st.session_state.record_selector = st.session_state.selected_record_index
+if st.session_state.record_selector != st.session_state.selected_record_index:
+    st.session_state.record_selector = st.session_state.selected_record_index
+
+with st.sidebar:
+    st.divider()
+    st.subheader("Navigation")
+    st.caption(f"{st.session_state.selected_record_index + 1} / {len(records)}")
+
+    prev_col, next_col = st.columns(2)
+    with prev_col:
+        st.button(
+            "前の論文",
+            use_container_width=True,
+            disabled=st.session_state.selected_record_index <= 0,
+            on_click=set_selected_record,
+            args=(st.session_state.selected_record_index - 1, len(records)),
+        )
+    with next_col:
+        st.button(
+            "次の論文",
+            use_container_width=True,
+            disabled=st.session_state.selected_record_index >= len(records) - 1,
+            on_click=set_selected_record,
+            args=(st.session_state.selected_record_index + 1, len(records)),
+        )
+
+    target_record_number = st.number_input(
+        "n番目の論文へ",
+        min_value=1,
+        max_value=len(records),
+        value=st.session_state.selected_record_index + 1,
+        step=1,
+    )
+    st.button(
+        "指定番号へ移動",
+        use_container_width=True,
+        on_click=set_selected_record,
+        args=(int(target_record_number) - 1, len(records)),
+    )
+selected = st.sidebar.selectbox(
+    "確認するレコード",
+    options=list(range(len(records))),
+    key="record_selector",
+    on_change=sync_selected_record_from_selectbox,
+    format_func=lambda index: f"{index + 1}. {record_labels[index]}",
+)
+
+record = records[selected]
+records[selected] = strip_position_fields(record)
+record = records[selected]
+pdf_url = st.sidebar.text_input(
+    "PDF URL",
+    value=get_arxiv_pdf_url(record),
+    key=f"pdf_url_{selected}",
+)
+open_pdf_in_chrome_once(pdf_url)
+st.sidebar.caption("PDFはChromeの別ウィンドウで開きます。")
+
+st.markdown('<div class="json-pane-marker"></div>', unsafe_allow_html=True)
+st.subheader("JSON")
+tabs = st.tabs(["フォーム編集", "Raw JSON", "差分"])
+
+with tabs[0]:
+    top_cols = st.columns(2)
+    with top_cols[0]:
+        st.text_input("arxiv_id", value=str(record.get("arxiv_id", "")), disabled=True)
+    with top_cols[1]:
+        st.text_input("doc_class", value=str(record.get("doc_class", "")), disabled=True)
+
+    author_editor(record, selected)
+
+with tabs[1]:
+    edited = st.text_area(
+        "選択中レコード",
+        value=json.dumps(strip_position_fields(record), ensure_ascii=False, indent=2),
+        height=700,
+        key=f"raw_json_{selected}",
+    )
+    if st.button("Raw JSONを反映", use_container_width=True):
+        try:
+            parsed = json.loads(edited)
+            if not isinstance(parsed, dict):
+                st.error("選択中レコードはJSON objectにしてください。")
+            else:
+                records[selected] = strip_position_fields(parsed)
+                st.session_state.pdf_opened_request_id = st.session_state.get("pdf_open_request_id", 0)
+                st.rerun()
+        except json.JSONDecodeError as exc:
+            st.error(f"JSON parse error: {exc}")
+
+with tabs[2]:
+    original = strip_position_fields(st.session_state.original_records[selected])
+    before = json.dumps(original, ensure_ascii=False, indent=2).splitlines()
+    after = json.dumps(strip_position_fields(record), ensure_ascii=False, indent=2).splitlines()
+    if before == after:
+        st.success("このレコードはまだ変更されていません。")
+    else:
+        st.caption("左が読み込み時、右が現在の内容です。")
+        diff_cols = st.columns(2)
+        with diff_cols[0]:
+            st.code("\n".join(before), language="json")
+        with diff_cols[1]:
+            st.code("\n".join(after), language="json")
+
+st.divider()
+if st.button("確認して次へ", type="primary", use_container_width=True):
+    confirm_next_dialog(selected)
