@@ -14,6 +14,13 @@ from typing import Any
 import streamlit as st
 
 
+STATUS_UNCONFIRMED = "unconfirmed"
+STATUS_CONFIRMED = "confirmed"
+STATUS_MODIFIED = "modified"
+STATUS_NEEDS_REVIEW = "needs_review"
+WORKFLOW_KEYS = {"status", "admin_check_required", "admin_check_reason"}
+
+
 st.set_page_config(
     page_title="JSON/PDF Checker",
     page_icon="LC",
@@ -135,9 +142,18 @@ def load_json_records(text: str) -> list[dict[str, Any]]:
 
 def dump_jsonl(records: list[dict[str, Any]]) -> str:
     return "\n".join(
-        json.dumps(strip_position_fields(record), ensure_ascii=False, separators=(",", ":"))
+        json.dumps(prepare_record_for_output(record), ensure_ascii=False, separators=(",", ":"))
         for record in records
     )
+
+
+def prepare_record_for_output(record: dict[str, Any]) -> dict[str, Any]:
+    output_record = strip_position_fields(record)
+    if isinstance(output_record, dict):
+        output_record.setdefault("status", STATUS_UNCONFIRMED)
+        output_record.setdefault("admin_check_required", False)
+        output_record.setdefault("admin_check_reason", "")
+    return output_record
 
 
 def strip_position_fields(value: Any) -> Any:
@@ -150,6 +166,40 @@ def strip_position_fields(value: Any) -> Any:
     if isinstance(value, list):
         return [strip_position_fields(item) for item in value]
     return value
+
+
+def strip_workflow_fields(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: strip_workflow_fields(item)
+            for key, item in value.items()
+            if key not in WORKFLOW_KEYS
+        }
+    if isinstance(value, list):
+        return [strip_workflow_fields(item) for item in value]
+    return value
+
+
+def ensure_review_metadata(record: dict[str, Any]) -> None:
+    record.setdefault("status", STATUS_UNCONFIRMED)
+    record.setdefault("admin_check_required", False)
+    record.setdefault("admin_check_reason", "")
+
+
+def record_content_changed(record: dict[str, Any], original_record: dict[str, Any]) -> bool:
+    current = strip_workflow_fields(strip_position_fields(record))
+    original = strip_workflow_fields(strip_position_fields(original_record))
+    return current != original
+
+
+def update_record_status(record: dict[str, Any], original_record: dict[str, Any]) -> None:
+    ensure_review_metadata(record)
+    if bool(record.get("admin_check_required")):
+        record["status"] = STATUS_NEEDS_REVIEW
+    elif record_content_changed(record, original_record):
+        record["status"] = STATUS_MODIFIED
+    else:
+        record["status"] = STATUS_CONFIRMED
 
 
 def get_arxiv_pdf_url(record: dict[str, Any]) -> str:
@@ -552,8 +602,10 @@ def sync_selected_record_from_selectbox() -> None:
 
 @st.dialog("編集内容を確認")
 def confirm_next_dialog(selected_index: int) -> None:
+    preview_record = copy.deepcopy(st.session_state.records[selected_index])
+    update_record_status(preview_record, st.session_state.original_records[selected_index])
     current_record_json = json.dumps(
-        strip_position_fields(st.session_state.records[selected_index]),
+        prepare_record_for_output(preview_record),
         ensure_ascii=False,
         indent=2,
     )
@@ -568,6 +620,10 @@ def confirm_next_dialog(selected_index: int) -> None:
     confirm_col, cancel_col = st.columns(2)
     with confirm_col:
         if st.button("確認して次へ", type="primary", use_container_width=True):
+            update_record_status(
+                st.session_state.records[selected_index],
+                st.session_state.original_records[selected_index],
+            )
             if selected_index < len(st.session_state.records) - 1:
                 st.session_state.pending_selected_record_index = selected_index + 1
                 request_pdf_open()
@@ -597,6 +653,8 @@ with st.sidebar:
                 st.session_state.records = [
                     strip_position_fields(record) for record in load_json_records(text)
                 ]
+                for record in st.session_state.records:
+                    ensure_review_metadata(record)
                 st.session_state.original_records = copy.deepcopy(st.session_state.records)
                 st.session_state.uploaded_dataset_signature = upload_signature
                 close_current_pdf_window()
@@ -683,6 +741,7 @@ selected = st.sidebar.selectbox(
 record = records[selected]
 records[selected] = strip_position_fields(record)
 record = records[selected]
+ensure_review_metadata(record)
 pdf_url = st.sidebar.text_input(
     "PDF URL",
     value=get_arxiv_pdf_url(record),
@@ -717,6 +776,7 @@ with tabs[1]:
             if not isinstance(parsed, dict):
                 st.error("選択中レコードはJSON objectにしてください。")
             else:
+                ensure_review_metadata(parsed)
                 records[selected] = strip_position_fields(parsed)
                 st.session_state.pdf_opened_request_id = st.session_state.get("pdf_open_request_id", 0)
                 st.rerun()
@@ -738,5 +798,29 @@ with tabs[2]:
             st.code("\n".join(after), language="json")
 
 st.divider()
+st.subheader("確認ステータス")
+review_cols = st.columns([1, 1])
+with review_cols[0]:
+    needs_admin_check = st.checkbox(
+        "管理者によるチェックが必要",
+        value=bool(record.get("admin_check_required", False)),
+        key=f"admin_check_required_{selected}",
+    )
+record["admin_check_required"] = needs_admin_check
+if needs_admin_check:
+    record["status"] = STATUS_NEEDS_REVIEW
+    record["admin_check_reason"] = st.text_area(
+        "チェックが必要な理由",
+        value=str(record.get("admin_check_reason", "")),
+        key=f"admin_check_reason_{selected}",
+        height=90,
+    )
+else:
+    record["admin_check_reason"] = ""
+    if record.get("status") == STATUS_NEEDS_REVIEW:
+        record["status"] = STATUS_UNCONFIRMED
+with review_cols[1]:
+    st.text_input("status", value=str(record.get("status", STATUS_UNCONFIRMED)), disabled=True)
+
 if st.button("確認して次へ", type="primary", use_container_width=True):
     confirm_next_dialog(selected)
