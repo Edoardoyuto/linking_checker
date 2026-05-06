@@ -5,14 +5,19 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import webbrowser
-import winreg
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 from typing import Any
 
 import streamlit as st
+
+if sys.platform == "win32":
+    import winreg
+else:
+    winreg = None
 
 
 STATUS_UNCONFIRMED = "unconfirmed"
@@ -229,7 +234,7 @@ def close_current_pdf_window() -> None:
         return
 
     try:
-        if pid:
+        if pid and sys.platform == "win32":
             subprocess.run(
                 ["taskkill", "/PID", str(pid), "/T", "/F"],
                 stdout=subprocess.DEVNULL,
@@ -246,22 +251,27 @@ def close_current_pdf_window() -> None:
 
 
 def find_chrome_path() -> str | None:
-    registry_paths = [
-        (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe"),
-        (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe"),
-        (winreg.HKEY_CURRENT_USER, r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe"),
-    ]
-    for root_key, sub_key in registry_paths:
-        try:
-            with winreg.OpenKey(root_key, sub_key) as key:
-                chrome_path = winreg.QueryValue(key, None)
-                if chrome_path and os.path.exists(chrome_path):
-                    return chrome_path
-        except OSError:
-            pass
+    if winreg is not None:
+        registry_paths = [
+            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe"),
+            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe"),
+            (winreg.HKEY_CURRENT_USER, r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe"),
+        ]
+        for root_key, sub_key in registry_paths:
+            try:
+                with winreg.OpenKey(root_key, sub_key) as key:
+                    chrome_path = winreg.QueryValue(key, None)
+                    if chrome_path and os.path.exists(chrome_path):
+                        return chrome_path
+            except OSError:
+                pass
 
     chrome_candidates = [
         shutil.which("chrome"),
+        shutil.which("google-chrome"),
+        shutil.which("google-chrome-stable"),
+        shutil.which("chromium"),
+        shutil.which("chromium-browser"),
         shutil.which("chrome.exe"),
         r"C:\Program Files\Google\Chrome\Application\chrome.exe",
         r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
