@@ -9,7 +9,7 @@ import tempfile
 import webbrowser
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
-from typing import Any
+from typing import Any, Dict, List, Optional
 
 import streamlit as st
 
@@ -104,7 +104,7 @@ def fetch_pdf_bytes(pdf_url: str) -> bytes:
     return data
 
 
-def load_json_records(text: str) -> list[dict[str, Any]]:
+def load_json_records(text: str) -> List[Dict[str, Any]]:
     text = text.strip()
     if not text:
         return []
@@ -112,7 +112,7 @@ def load_json_records(text: str) -> list[dict[str, Any]]:
     try:
         parsed = json.loads(text)
     except json.JSONDecodeError:
-        records: list[dict[str, Any]] = []
+        records: List[Dict[str, Any]] = []
         for line_no, line in enumerate(text.splitlines(), start=1):
             line = line.strip()
             if not line:
@@ -133,7 +133,7 @@ def load_json_records(text: str) -> list[dict[str, Any]]:
     raise ValueError("JSON must be an object, an array of objects, or JSONL objects.")
 
 
-def dump_jsonl(records: list[dict[str, Any]]) -> str:
+def dump_jsonl(records: List[Dict[str, Any]]) -> str:
     return "\n".join(
         json.dumps(strip_position_fields(record), ensure_ascii=False, separators=(",", ":"))
         for record in records
@@ -152,7 +152,7 @@ def strip_position_fields(value: Any) -> Any:
     return value
 
 
-def get_arxiv_pdf_url(record: dict[str, Any]) -> str:
+def get_arxiv_pdf_url(record: Dict[str, Any]) -> str:
     arxiv_id = str(record.get("arxiv_id", "")).strip()
     return f"https://arxiv.org/pdf/{arxiv_id}" if arxiv_id else ""
 
@@ -178,14 +178,14 @@ def close_current_pdf_window() -> None:
         return
 
     try:
-        if pid:
+        if os.name == "nt" and pid:
             subprocess.run(
                 ["taskkill", "/PID", str(pid), "/T", "/F"],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 check=False,
             )
-        elif process.poll() is None:
+        elif process and process.poll() is None:
             process.terminate()
     except Exception:
         pass
@@ -194,10 +194,19 @@ def close_current_pdf_window() -> None:
         st.session_state.pdf_window_pid = None
 
 
-def find_chrome_path() -> str | None:
+def find_chrome_path() -> Optional[str]:
     chrome_candidates = [
+        shutil.which("google-chrome"),
+        shutil.which("google-chrome-stable"),
+        shutil.which("chromium"),
+        shutil.which("chromium-browser"),
         shutil.which("chrome"),
         shutil.which("chrome.exe"),
+        "/usr/bin/google-chrome",
+        "/usr/bin/google-chrome-stable",
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
         os.path.join(os.environ.get("PROGRAMFILES", ""), "Google", "Chrome", "Application", "chrome.exe"),
         os.path.join(
             os.environ.get("PROGRAMFILES(X86)", ""),
@@ -426,7 +435,7 @@ def render_pdf_bytes(pdf_bytes: bytes, height: int) -> None:
     )
 
 
-def render_pdf_viewer(pdf_bytes: bytes | None, pdf_url: str, height: int) -> None:
+def render_pdf_viewer(pdf_bytes: Optional[bytes], pdf_url: str, height: int) -> None:
     if pdf_bytes:
         render_pdf_bytes(pdf_bytes, height)
         return
@@ -443,15 +452,18 @@ def render_pdf_viewer(pdf_bytes: bytes | None, pdf_url: str, height: int) -> Non
     st.info("PDFをアップロードするか、JSONに arxiv_id を入れてください。")
 
 
-def ensure_author_shape(author: dict[str, Any]) -> dict[str, Any]:
+def ensure_author_shape(author: Dict[str, Any]) -> Dict[str, Any]:
     author.setdefault("name", "")
+    author.setdefault("email", "")
+    author.setdefault("orcid", "")
+    author.setdefault("other", "")
     affiliations = author.get("affiliations")
     if not isinstance(affiliations, list):
         author["affiliations"] = []
     return author
 
 
-def author_editor(record: dict[str, Any], record_index: int) -> None:
+def author_editor(record: Dict[str, Any], record_index: int) -> None:
     authors = record.setdefault("authors", [])
     if not isinstance(authors, list):
         st.warning("authors が配列ではないため、空の配列に置き換えました。")
@@ -461,14 +473,22 @@ def author_editor(record: dict[str, Any], record_index: int) -> None:
     left, right = st.columns([1, 1])
     with left:
         if st.button("著者を追加", use_container_width=True):
-            authors.append({"name": "", "affiliations": []})
+            authors.append(
+                {"name": "", "email": "", "orcid": "", "other": "", "affiliations": []}
+            )
             st.rerun()
     with right:
         st.metric("著者数", len(authors))
 
     for author_index, author in enumerate(authors):
         if not isinstance(author, dict):
-            authors[author_index] = {"name": str(author), "affiliations": []}
+            authors[author_index] = {
+                "name": str(author),
+                "email": "",
+                "orcid": "",
+                "other": "",
+                "affiliations": [],
+            }
             author = authors[author_index]
 
         ensure_author_shape(author)
@@ -478,6 +498,25 @@ def author_editor(record: dict[str, Any], record_index: int) -> None:
                 "Name",
                 value=str(author.get("name", "")),
                 key=f"name_{record_index}_{author_index}",
+            )
+            author_cols = st.columns(2)
+            with author_cols[0]:
+                author["email"] = st.text_input(
+                    "Email",
+                    value=str(author.get("email", "")),
+                    key=f"email_{record_index}_{author_index}",
+                )
+            with author_cols[1]:
+                author["orcid"] = st.text_input(
+                    "ORCID",
+                    value=str(author.get("orcid", "")),
+                    key=f"orcid_{record_index}_{author_index}",
+                )
+            author["other"] = st.text_area(
+                "その他",
+                value=str(author.get("other", "")),
+                key=f"other_{record_index}_{author_index}",
+                height=68,
             )
 
             button_cols = st.columns(2)
@@ -512,7 +551,7 @@ def author_editor(record: dict[str, Any], record_index: int) -> None:
                     "Institution",
                     value=str(affiliation.get("institution", "")),
                     key=f"inst_{record_index}_{author_index}_{affiliation_index}",
-                    height=60,
+                    height=68,
                 )
                 if st.button(
                     "所属を削除",
@@ -522,7 +561,7 @@ def author_editor(record: dict[str, Any], record_index: int) -> None:
                     st.rerun()
 
 
-def record_summary(record: dict[str, Any]) -> str:
+def record_summary(record: Dict[str, Any]) -> str:
     arxiv_id = record.get("arxiv_id", "")
     authors = record.get("authors", [])
     names = []
