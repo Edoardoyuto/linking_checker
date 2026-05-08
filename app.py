@@ -537,11 +537,73 @@ def ensure_author_shape(author: Dict[str, Any]) -> Dict[str, Any]:
     author.setdefault("name", "")
     author.setdefault("email", "")
     author.setdefault("orcid", "")
-    author.setdefault("other", "")
+    other = author.get("other")
+    if other is None or other == "":
+        author["other"] = {}
+    elif not isinstance(other, dict):
+        author["other"] = {"note": str(other)}
     affiliations = author.get("affiliations")
     if not isinstance(affiliations, list):
         author["affiliations"] = []
     return author
+
+
+def other_editor(author: Dict[str, Any], record_index: int, author_index: int) -> None:
+    other = author.setdefault("other", {})
+    if not isinstance(other, dict):
+        other = {"note": str(other)}
+        author["other"] = other
+
+    st.caption("その他")
+    if st.button(
+        "その他項目を追加",
+        key=f"add_other_{record_index}_{author_index}",
+        use_container_width=True,
+    ):
+        base_key = "key"
+        next_index = 1
+        new_key = base_key
+        while new_key in other:
+            next_index += 1
+            new_key = f"{base_key}_{next_index}"
+        other[new_key] = ""
+        st.rerun()
+
+    for other_index, (other_key, other_value) in enumerate(list(other.items())):
+        cols = st.columns([1, 2, 0.7])
+        with cols[0]:
+            new_key = st.text_input(
+                "キー",
+                value=str(other_key),
+                key=f"other_key_{record_index}_{author_index}_{other_index}",
+            ).strip()
+        with cols[1]:
+            new_value = st.text_area(
+                "値",
+                value=str(other_value),
+                key=f"other_value_{record_index}_{author_index}_{other_index}",
+                height=68,
+            )
+        with cols[2]:
+            delete_other = st.button(
+                "削除",
+                key=f"del_other_{record_index}_{author_index}_{other_index}",
+                use_container_width=True,
+            )
+
+        if delete_other:
+            other.pop(other_key, None)
+            st.rerun()
+
+        if not new_key:
+            st.warning("その他項目のキーは空にできません。")
+            continue
+        if new_key != other_key and new_key in other:
+            st.warning(f"その他項目のキー `{new_key}` は既に使われています。")
+            continue
+        if new_key != other_key:
+            other.pop(other_key, None)
+        other[new_key] = new_value
 
 
 def author_editor(record: Dict[str, Any], record_index: int) -> None:
@@ -555,7 +617,7 @@ def author_editor(record: Dict[str, Any], record_index: int) -> None:
     with left:
         if st.button("著者を追加", use_container_width=True):
             authors.append(
-                {"name": "", "email": "", "orcid": "", "other": "", "affiliations": []}
+                {"name": "", "email": "", "orcid": "", "other": {}, "affiliations": []}
             )
             st.rerun()
     with right:
@@ -567,7 +629,7 @@ def author_editor(record: Dict[str, Any], record_index: int) -> None:
                 "name": str(author),
                 "email": "",
                 "orcid": "",
-                "other": "",
+                "other": {},
                 "affiliations": [],
             }
             author = authors[author_index]
@@ -593,12 +655,7 @@ def author_editor(record: Dict[str, Any], record_index: int) -> None:
                     value=str(author.get("orcid", "")),
                     key=f"orcid_{record_index}_{author_index}",
                 )
-            author["other"] = st.text_area(
-                "その他",
-                value=str(author.get("other", "")),
-                key=f"other_{record_index}_{author_index}",
-                height=68,
-            )
+            other_editor(author, record_index, author_index)
 
             button_cols = st.columns(2)
             with button_cols[0]:
