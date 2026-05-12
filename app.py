@@ -692,18 +692,21 @@ def author_editor(record: Dict[str, Any], record_index: int) -> None:
 
                 st.divider()
                 st.caption(f"Affiliation {affiliation_index + 1}")
-                affiliation["institution"] = st.text_area(
-                    "Institution",
-                    value=str(affiliation.get("institution", "")),
-                    key=f"inst_{record_index}_{author_index}_{affiliation_index}",
-                    height=68,
-                )
-                affiliation["address"] = st.text_area(
-                    "Address",
-                    value=str(affiliation.get("address", "")),
-                    key=f"addr_{record_index}_{author_index}_{affiliation_index}",
-                    height=68,
-                )
+                affiliation_cols = st.columns(2)
+                with affiliation_cols[0]:
+                    affiliation["institution"] = st.text_area(
+                        "Institution",
+                        value=str(affiliation.get("institution", "")),
+                        key=f"inst_{record_index}_{author_index}_{affiliation_index}",
+                        height=68,
+                    )
+                with affiliation_cols[1]:
+                    affiliation["address"] = st.text_area(
+                        "Address",
+                        value=str(affiliation.get("address", "")),
+                        key=f"addr_{record_index}_{author_index}_{affiliation_index}",
+                        height=68,
+                    )
                 if st.button(
                     "所属を削除",
                     key=f"del_aff_{record_index}_{author_index}_{affiliation_index}",
