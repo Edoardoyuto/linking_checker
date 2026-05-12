@@ -153,6 +153,13 @@ def dump_jsonl(records: List[Dict[str, Any]]) -> str:
     )
 
 
+def reviewed_output_filename(original_filename: str) -> str:
+    filename = original_filename.replace("\\", "/").rsplit("/", 1)[-1].strip()
+    if not filename:
+        filename = "review_result.jsonl"
+    return f"reviewd_{filename}"
+
+
 def prepare_record_for_output(record: dict[str, Any]) -> dict[str, Any]:
     output_record = strip_position_fields(record)
     if isinstance(output_record, dict):
@@ -734,6 +741,8 @@ def initialize_state() -> None:
         st.session_state.records = []
     if "original_records" not in st.session_state:
         st.session_state.original_records = copy.deepcopy(st.session_state.records)
+    if "uploaded_dataset_filename" not in st.session_state:
+        st.session_state.uploaded_dataset_filename = "review_result.jsonl"
 
 
 def sync_selected_record_from_selectbox() -> None:
@@ -800,6 +809,7 @@ with st.sidebar:
                     ensure_review_metadata(record)
                 st.session_state.original_records = copy.deepcopy(st.session_state.records)
                 st.session_state.uploaded_dataset_signature = upload_signature
+                st.session_state.uploaded_dataset_filename = json_file.name
                 close_current_pdf_window()
                 st.session_state.pdf_opened_request_id = None
                 set_selected_record(0, len(st.session_state.records))
@@ -811,7 +821,7 @@ with st.sidebar:
     st.download_button(
         "修正済みJSONLをダウンロード",
         data=dump_jsonl(st.session_state.records),
-        file_name="review_result.jsonl",
+        file_name=reviewed_output_filename(st.session_state.uploaded_dataset_filename),
         mime="application/x-jsonlines",
         use_container_width=True,
         disabled=not st.session_state.records,
