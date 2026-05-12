@@ -548,6 +548,12 @@ def ensure_author_shape(author: Dict[str, Any]) -> Dict[str, Any]:
     return author
 
 
+def ensure_affiliation_shape(affiliation: Dict[str, Any]) -> Dict[str, Any]:
+    affiliation.setdefault("institution", "")
+    affiliation.setdefault("address", "")
+    return affiliation
+
+
 def other_editor(author: Dict[str, Any], record_index: int, author_index: int) -> None:
     other = author.setdefault("other", {})
     if not isinstance(other, dict):
@@ -682,6 +688,7 @@ def author_editor(record: Dict[str, Any], record_index: int) -> None:
                         "address": "",
                     }
                     affiliation = author["affiliations"][affiliation_index]
+                ensure_affiliation_shape(affiliation)
 
                 st.divider()
                 st.caption(f"Affiliation {affiliation_index + 1}")
@@ -689,6 +696,12 @@ def author_editor(record: Dict[str, Any], record_index: int) -> None:
                     "Institution",
                     value=str(affiliation.get("institution", "")),
                     key=f"inst_{record_index}_{author_index}_{affiliation_index}",
+                    height=68,
+                )
+                affiliation["address"] = st.text_area(
+                    "Address",
+                    value=str(affiliation.get("address", "")),
+                    key=f"addr_{record_index}_{author_index}_{affiliation_index}",
                     height=68,
                 )
                 if st.button(
